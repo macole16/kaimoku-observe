@@ -39,6 +39,58 @@ func nullJSON(data json.RawMessage) []byte {
 	return data
 }
 
+// scanner is satisfied by *sql.Row and *sql.Rows.
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+// observationColumns is the canonical SELECT list for observations.
+const observationColumns = `id, ref, user_id, domain_id, title, description,
+	category_user, severity_user, location, auto_context,
+	triage, status, resolution_internal, resolution_user,
+	related_observations, faq_article_id,
+	created_at, updated_at, resolved_at`
+
+func scanObservation(s scanner) (observe.Observation, error) {
+	var (
+		o            observe.Observation
+		severityUser sql.NullString
+		location     sql.NullString
+		triage       []byte
+		resInternal  sql.NullString
+		resUser      sql.NullString
+		relatedObs   []byte
+		faqID        sql.NullInt64
+		resolvedAt   sql.NullTime
+	)
+
+	err := s.Scan(
+		&o.ID, &o.Ref, &o.UserID, &o.DomainID, &o.Title, &o.Description,
+		&o.CategoryUser, &severityUser, &location, &o.AutoContext,
+		&triage, &o.Status, &resInternal, &resUser,
+		&relatedObs, &faqID,
+		&o.CreatedAt, &o.UpdatedAt, &resolvedAt,
+	)
+	if err != nil {
+		return o, err
+	}
+
+	o.SeverityUser = severityUser.String
+	o.Location = location.String
+	o.Triage = triage
+	o.ResolutionInternal = resInternal.String
+	o.ResolutionUser = resUser.String
+	o.RelatedObservations = relatedObs
+	if faqID.Valid {
+		o.FaqArticleID = &faqID.Int64
+	}
+	if resolvedAt.Valid {
+		o.ResolvedAt = &resolvedAt.Time
+	}
+
+	return o, nil
+}
+
 // CreateObservation inserts a new observation and populates its ID and Ref.
 func (s *Store) CreateObservation(ctx context.Context, obs *observe.Observation) error {
 	var seq int64
@@ -70,60 +122,25 @@ func (s *Store) CreateObservation(ctx context.Context, obs *observe.Observation)
 
 // GetObservation retrieves a single observation by ID.
 func (s *Store) GetObservation(ctx context.Context, id int64) (*observe.Observation, error) {
-	var (
-		o            observe.Observation
-		severityUser sql.NullString
-		location     sql.NullString
-		triage       []byte
-		resInternal  sql.NullString
-		resUser      sql.NullString
-		relatedObs   []byte
-		faqID        sql.NullInt64
-		resolvedAt   sql.NullTime
-	)
-
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, ref, user_id, domain_id, title, description,
-			category_user, severity_user, location, auto_context,
-			triage, status, resolution_internal, resolution_user,
-			related_observations, faq_article_id,
-			created_at, updated_at, resolved_at
-		FROM observations WHERE id = $1`, id,
-	).Scan(
-		&o.ID, &o.Ref, &o.UserID, &o.DomainID, &o.Title, &o.Description,
-		&o.CategoryUser, &severityUser, &location, &o.AutoContext,
-		&triage, &o.Status, &resInternal, &resUser,
-		&relatedObs, &faqID,
-		&o.CreatedAt, &o.UpdatedAt, &resolvedAt,
-	)
+	o, err := scanObservation(s.db.QueryRowContext(ctx,
+		`SELECT `+observationColumns+` FROM observations WHERE id = $1`, id))
 	if err != nil {
 		return nil, fmt.Errorf("get observation %d: %w", id, err)
 	}
-
-	o.SeverityUser = severityUser.String
-	o.Location = location.String
-	o.Triage = triage
-	o.ResolutionInternal = resInternal.String
-	o.ResolutionUser = resUser.String
-	o.RelatedObservations = relatedObs
-	if faqID.Valid {
-		o.FaqArticleID = &faqID.Int64
-	}
-	if resolvedAt.Valid {
-		o.ResolvedAt = &resolvedAt.Time
-	}
-
 	return &o, nil
 }
 
 // GetObservationByRef retrieves an observation by its human-readable ref.
 func (s *Store) GetObservationByRef(ctx context.Context, ref string) (*observe.Observation, error) {
-	var id int64
-	err := s.db.QueryRowContext(ctx, "SELECT id FROM observations WHERE ref = $1", ref).Scan(&id)
+	o, err := scanObservation(s.db.QueryRowContext(ctx,
+		`SELECT `+observationColumns+` FROM observations WHERE ref = $1`, ref))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get observation by ref %s: %w", ref, err)
 	}
-	return s.GetObservation(ctx, id)
+	return &o, nil
 }
 
 // ListObservations returns a filtered, paginated list of observations and the total count.
@@ -183,15 +200,9 @@ func (s *Store) ListObservations(ctx context.Context, f observe.ObservationFilte
 	offsetPlaceholder := fmt.Sprintf("$%d", idx)
 	args = append(args, offset)
 
-	query := fmt.Sprintf(`
-		SELECT id, ref, user_id, domain_id, title, description,
-			category_user, severity_user, location, auto_context,
-			triage, status, resolution_internal, resolution_user,
-			related_observations, faq_article_id,
-			created_at, updated_at, resolved_at
-		FROM observations%s
+	query := fmt.Sprintf(`SELECT %s FROM observations%s
 		ORDER BY created_at DESC
-		LIMIT %s OFFSET %s`, whereSQL, limitPlaceholder, offsetPlaceholder)
+		LIMIT %s OFFSET %s`, observationColumns, whereSQL, limitPlaceholder, offsetPlaceholder)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -201,41 +212,10 @@ func (s *Store) ListObservations(ctx context.Context, f observe.ObservationFilte
 
 	var result []observe.Observation
 	for rows.Next() {
-		var (
-			o            observe.Observation
-			severityUser sql.NullString
-			location     sql.NullString
-			triage       []byte
-			resInternal  sql.NullString
-			resUser      sql.NullString
-			relatedObs   []byte
-			faqID        sql.NullInt64
-			resolvedAt   sql.NullTime
-		)
-
-		if err := rows.Scan(
-			&o.ID, &o.Ref, &o.UserID, &o.DomainID, &o.Title, &o.Description,
-			&o.CategoryUser, &severityUser, &location, &o.AutoContext,
-			&triage, &o.Status, &resInternal, &resUser,
-			&relatedObs, &faqID,
-			&o.CreatedAt, &o.UpdatedAt, &resolvedAt,
-		); err != nil {
+		o, err := scanObservation(rows)
+		if err != nil {
 			return nil, 0, fmt.Errorf("scan observation: %w", err)
 		}
-
-		o.SeverityUser = severityUser.String
-		o.Location = location.String
-		o.Triage = triage
-		o.ResolutionInternal = resInternal.String
-		o.ResolutionUser = resUser.String
-		o.RelatedObservations = relatedObs
-		if faqID.Valid {
-			o.FaqArticleID = &faqID.Int64
-		}
-		if resolvedAt.Valid {
-			o.ResolvedAt = &resolvedAt.Time
-		}
-
 		result = append(result, o)
 	}
 	if err := rows.Err(); err != nil {
@@ -264,9 +244,9 @@ func (s *Store) UpdateObservationStatus(ctx context.Context, id int64, status st
 func (s *Store) UpdateObservationTriage(ctx context.Context, id int64, triage []byte) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE observations
-		SET triage = $1, status = 'triaged', updated_at = now()
-		WHERE id = $2`,
-		triage, id)
+		SET triage = $1, status = $2, updated_at = now()
+		WHERE id = $3`,
+		triage, observe.StatusTriaged, id)
 	if err != nil {
 		return fmt.Errorf("update observation triage: %w", err)
 	}
@@ -281,13 +261,13 @@ func (s *Store) UpdateObservationTriage(ctx context.Context, id int64, triage []
 func (s *Store) ResolveObservation(ctx context.Context, id int64, resolutionUser, resolutionInternal string) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE observations
-		SET status = 'resolved',
-			resolution_user = $1,
-			resolution_internal = $2,
+		SET status = $1,
+			resolution_user = $2,
+			resolution_internal = $3,
 			resolved_at = now(),
 			updated_at = now()
-		WHERE id = $3`,
-		resolutionUser, resolutionInternal, id)
+		WHERE id = $4`,
+		observe.StatusResolved, resolutionUser, resolutionInternal, id)
 	if err != nil {
 		return fmt.Errorf("resolve observation: %w", err)
 	}
@@ -302,9 +282,9 @@ func (s *Store) ResolveObservation(ctx context.Context, id int64, resolutionUser
 func (s *Store) LinkFAQ(ctx context.Context, obsID int64, faqID int64) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE observations
-		SET faq_article_id = $1, status = 'published', updated_at = now()
-		WHERE id = $2`,
-		faqID, obsID)
+		SET faq_article_id = $1, status = $2, updated_at = now()
+		WHERE id = $3`,
+		faqID, observe.StatusPublished, obsID)
 	if err != nil {
 		return fmt.Errorf("link faq: %w", err)
 	}
@@ -454,30 +434,24 @@ func (s *Store) ListFAQ(ctx context.Context, category string, limit int) ([]obse
 		limit = 50
 	}
 
-	var (
-		query string
-		args  []any
-	)
+	q := `SELECT id, ref, title, category, tags, problem, resolution,
+		related_articles, observation_count, deflection_count,
+		published_at, last_triggered_at, improvement_flagged,
+		views, helpful_yes, helpful_no
+	FROM faq_articles`
 
+	var args []any
+	idx := 0
 	if category != "" {
-		query = `SELECT id, ref, title, category, tags, problem, resolution,
-			related_articles, observation_count, deflection_count,
-			published_at, last_triggered_at, improvement_flagged,
-			views, helpful_yes, helpful_no
-		FROM faq_articles WHERE category = $1
-		ORDER BY published_at DESC LIMIT $2`
-		args = []any{category, limit}
-	} else {
-		query = `SELECT id, ref, title, category, tags, problem, resolution,
-			related_articles, observation_count, deflection_count,
-			published_at, last_triggered_at, improvement_flagged,
-			views, helpful_yes, helpful_no
-		FROM faq_articles
-		ORDER BY published_at DESC LIMIT $1`
-		args = []any{limit}
+		idx++
+		q += fmt.Sprintf(" WHERE category = $%d", idx)
+		args = append(args, category)
 	}
+	idx++
+	q += fmt.Sprintf(" ORDER BY published_at DESC LIMIT $%d", idx)
+	args = append(args, limit)
 
-	return s.scanFAQRows(ctx, query, args...)
+	return s.scanFAQRows(ctx, q, args...)
 }
 
 // SearchFAQ performs a simple text search across FAQ title, problem, and resolution.
@@ -535,14 +509,13 @@ func (s *Store) IncrementFAQViews(ctx context.Context, id int64) error {
 
 // RecordFAQFeedback records a helpful yes/no vote on a FAQ article.
 func (s *Store) RecordFAQFeedback(ctx context.Context, id int64, helpful bool) error {
-	var col string
 	if helpful {
-		col = "helpful_yes"
-	} else {
-		col = "helpful_no"
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE faq_articles SET helpful_yes = helpful_yes + 1 WHERE id = $1`, id)
+		return err
 	}
 	_, err := s.db.ExecContext(ctx,
-		fmt.Sprintf("UPDATE faq_articles SET %s = %s + 1 WHERE id = $1", col, col), id)
+		`UPDATE faq_articles SET helpful_no = helpful_no + 1 WHERE id = $1`, id)
 	return err
 }
 
@@ -634,12 +607,7 @@ func (s *Store) DashboardStats(ctx context.Context) (*observe.DashboardStats, er
 		ByStatus: make(map[string]int),
 	}
 
-	// Total count.
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM observations").Scan(&stats.Total); err != nil {
-		return nil, fmt.Errorf("dashboard total: %w", err)
-	}
-
-	// By status.
+	// By status (total derived from sum).
 	rows, err := s.db.QueryContext(ctx, "SELECT status, COUNT(*) FROM observations GROUP BY status")
 	if err != nil {
 		return nil, fmt.Errorf("dashboard by status: %w", err)
@@ -652,6 +620,7 @@ func (s *Store) DashboardStats(ctx context.Context) (*observe.DashboardStats, er
 			return nil, fmt.Errorf("scan status count: %w", err)
 		}
 		stats.ByStatus[status] = count
+		stats.Total += count
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -666,7 +635,8 @@ func (s *Store) DashboardStats(ctx context.Context) (*observe.DashboardStats, er
 
 	// High severity.
 	if err := s.db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM observations WHERE severity_user = 'blocking'",
+		"SELECT COUNT(*) FROM observations WHERE severity_user = $1",
+		observe.SeverityBlocking,
 	).Scan(&stats.HighSeverity); err != nil {
 		return nil, fmt.Errorf("dashboard high severity: %w", err)
 	}
