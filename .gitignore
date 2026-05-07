@@ -1,0 +1,21 @@
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Go build / test / profile artifacts
+*.test
+*.prof
+coverage.out
+coverage.html
+
+# Environment overrides (defensive — never commit secrets-bearing env files)
+.env
+.env.local
+.env.*.local
+
+# Claude Code session artifacts (regenerated automatically)
+.claude/scheduled_tasks.lock
+.agents/
+skills-lock.json
